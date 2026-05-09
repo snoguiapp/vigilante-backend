@@ -33,6 +33,34 @@ const lecturaSchema = new mongoose.Schema({
 
 const Lectura = mongoose.model('Lectura', lecturaSchema);
 
+const usuarioSchema = new mongoose.Schema({
+  expoPushToken: { type: String, required: true, unique: true },
+  dispositivoId: String, // Para saber de qué cliente es
+  fechaRegistro: { type: Date, default: Date.now }
+});
+
+const Usuario = mongoose.model('Usuario', usuarioSchema);
+
+app.post('/registrar-token', async (req, res) => {
+  const { token, dispositivoId } = req.body;
+
+  if (!token) return res.status(400).send('Falta el token');
+
+  try {
+    // Busca si el token ya existe, si no, lo crea (upsert)
+    await Usuario.findOneAndUpdate(
+      { expoPushToken: token },
+      { dispositivoId: dispositivoId },
+      { upsert: true, new: true }
+    );
+    console.log(`📱 Token registrado/actualizado: ${token}`);
+    res.status(200).send('Token guardado exitosamente');
+  } catch (error) {
+    console.error('Error al guardar token:', error);
+    res.status(500).send('Error interno');
+  }
+});
+
 // --- CONFIGURACIÓN MQTT ---
 const opcionesMqtt = {
   clientId: 'VigilanteBackend_' + Math.random().toString(16).substring(2, 10)
@@ -110,10 +138,33 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 async function enviarNotificacion(titulo, cuerpo) {
-  if (!Expo.isExpoPushToken(pushToken)) return;
-  const messages = [{ to: pushToken, sound: 'default', title: titulo, body: cuerpo }];
   try {
+    // 1. Buscamos todos los tokens guardados en la DB
+    const usuarios = await Usuario.find();
+    const tokens = usuarios.map(u => u.expoPushToken);
+
+    if (tokens.length === 0) return;
+
+    // 2. Preparamos los mensajes
+    let messages = [];
+    for (let pushToken of tokens) {
+      if (!Expo.isExpoPushToken(pushToken)) continue;
+      messages.push({
+        to: pushToken,
+        sound: 'default',
+        title: titulo,
+        body: cuerpo,
+        priority: 'high'
+      });
+    }
+
+    // 3. Enviamos en paquetes (chunks)
     let chunks = expo.chunkPushNotifications(messages);
-    for (let chunk of chunks) { await expo.sendPushNotificationsAsync(chunk); }
-  } catch (e) { console.error(e); }
+    for (let chunk of chunks) {
+      await expo.sendPushNotificationsAsync(chunk);
+    }
+    console.log(`📢 Alerta enviada a ${tokens.length} dispositivos.`);
+  } catch (error) {
+    console.error('❌ Error enviando notificaciones:', error);
+  }
 }
