@@ -132,6 +132,25 @@ app.get('/reporte-semanal', async (req, res) => {
   } catch (error) { res.status(500).send('Error'); }
 });
 
+// Ruta para obtener las últimas 24 lecturas (para la gráfica)
+app.get('/historial/:dispositivoId', async (req, res) => {
+  try {
+    const { dispositivoId } = req.params;
+    
+    // Buscamos las últimas 24 lecturas de ese dispositivo
+    // Las ordenamos por fecha (de la más reciente a la más vieja)
+    const lecturas = await Lectura.find({ dispositivoId })
+      .sort({ fecha: -1 })
+      .limit(24);
+
+    // Las invertimos para que en la gráfica salgan de izquierda (pasado) a derecha (presente)
+    res.json(lecturas.reverse());
+  } catch (error) {
+    console.error('Error al obtener historial:', error);
+    res.status(500).send('Error al obtener datos');
+  }
+});
+
 // --- INICIO DEL SERVIDOR ---
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Servidor en puerto ${PORT}`);
