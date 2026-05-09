@@ -1,7 +1,5 @@
 const mqtt = require('mqtt');
 const { Expo } = require('expo-server-sdk');
-
-
 const express = require('express');
 const ExcelJS = require('exceljs');
 const app = express();
@@ -67,28 +65,55 @@ client.on('message', (topic, message) => {
         const nivel = parseInt(message.toString());
         console.log(`💧 Nivel actual de la cisterna: ${nivel}%`);
 
-        // --- 1. CORRECCIÓN: ESTADO DE LA BOMBA PARA MONGO Y EXCEL ---
-        let estadoBombaActual = "Estable"; 
-        
-        // Invertimos la lógica según lo que ves en tu monitor:
-        if (nivel <= 25) {
-            estadoBombaActual = "Apagada"; // Si antes decía Encendida, ahora dice Apagada
-        } else if (nivel >= 95) {
-            estadoBombaActual = "Encendida"; // Si antes decía Apagada, ahora dice Encendida
+        // Variables para controlar el tiempo
+        if (typeof ultimoGuardado === 'undefined') {
+            global.ultimoGuardado = new Date(0); // Inicializar si no existe
         }
 
-        const nuevaLectura = new Lectura({
-            dispositivo: 'UACH1',
-            nivel: nivel,
-            estadoBomba: estadoBombaActual
-        });
+        const ahora = new Date();
+        const diferenciaHoras = (ahora - global.ultimoGuardado) / (1000 * 60 * 60); // Diferencia en horas
 
-        nuevaLectura.save()
-            .then(() => console.log(`💾 Guardado en DB: ${nivel}% - Bomba: ${estadoBombaActual}`))
-            .catch(err => console.error('❌ Error al guardar:', err));
-        // ----------------------------------------------------------
+        // --- LÓGICA DE GUARDADO SELECTIVO ---
+        let debeGuardar = false;
+        let razonGuardado = "";
 
-        // --- 2. LÓGICA DE NOTIFICACIONES ---
+        // Guardar si ha pasado 1 hora
+        if (diferenciaHoras >= 1) {
+            debeGuardar = true;
+            razonGuardado = "Registro programado (cada hora)";
+        }
+        
+        // Guardar si el nivel es crítico
+        if (nivel <= 25 || nivel >= 100) {
+            debeGuardar = true;
+            razonGuardado = "Nivel crítico";
+        }
+
+        // --- LÓGICA DE BOMBA ---
+        let estadoBombaActual = "Estable";
+        if (nivel <= 25) {
+            estadoBombaActual = "Apagada";
+        } else if (nivel >= 95) {
+            estadoBombaActual = "Encendida";
+        }
+
+        // Guardar solo si cumple las condiciones
+        if (debeGuardar) {
+            const nuevaLectura = new Lectura({
+                dispositivo: 'UACH1',
+                nivel: nivel,
+                estadoBomba: estadoBombaActual
+            });
+
+            nuevaLectura.save()
+                .then(() => {
+                    console.log(`💾 Guardado en DB: ${nivel}% - Bomba: ${estadoBombaActual} (${razonGuardado})`);
+                    global.ultimoGuardado = ahora; // Actualizar última fecha de guardado
+                })
+                .catch(err => console.error('❌ Error al guardar:', err));
+        }
+
+        // --- LÓGICA DE NOTIFICACIONES (sin cambios) ---
         if (nivel >= 95 && !avisoLlenoEnviado) {
             enviarNotificacion("¡Cisterna Llena! 🌊", "Nivel al máximo.");
             avisoLlenoEnviado = true;
@@ -105,6 +130,7 @@ client.on('message', (topic, message) => {
         }
     }
 });
+
 
 // RUTA PARA DESCARGAR REPORTE SEMANAL
 app.get('/reporte-semanal', async (req, res) => {
