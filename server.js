@@ -1,4 +1,4 @@
-require('dotenv').config(); // Carga las variables del archivo .env
+require('dotenv').config();
 const mqtt = require('mqtt');
 const { Expo } = require('expo-server-sdk');
 const express = require('express');
@@ -13,11 +13,22 @@ app.use(express.json());
 // --- CONFIGURACIÓN DESDE VARIABLES DE ENTORNO ---
 const PORT = process.env.PORT || 3000;
 const mongoURI = process.env.MONGO_URI;
-const pushToken = process.env.EXPO_PUSH_TOKEN;
 
 const expo = new Expo();
-let avisoLlenoEnviado = false;
-let avisoBajoEnviado = false;
+
+// ─────────────────────────────────────────────────────────────
+// CAMBIO 1: Ya no usamos banderas simples (avisoLlenoEnviado /
+// avisoBajoEnviado). Ahora guardamos el TIMESTAMP de la última
+// notificación enviada para cada estado, lo que nos permite
+// controlar intervalos de tiempo en lugar de solo "ya avisé / no avisé".
+// ─────────────────────────────────────────────────────────────
+let ultimaNotifBajo    = null; // Fecha del último aviso de nivel bajo (<=25)
+let ultimaNotifLleno   = null; // Fecha del último aviso de cisterna llena (>=100)
+let ultimaNotifEstable = null; // Fecha del último aviso de nivel estable (26–99)
+
+// Intervalos de repetición
+const INTERVALO_CRITICO_MS = 15 * 60 * 1000; // 15 minutos en milisegundos
+const INTERVALO_ESTABLE_MS = 60 * 60 * 1000; // 1 hora en milisegundos
 
 // --- CONEXIÓN BASE DE DATOS ---
 mongoose.connect(mongoURI)
@@ -35,7 +46,7 @@ const Lectura = mongoose.model('Lectura', lecturaSchema);
 
 const usuarioSchema = new mongoose.Schema({
   expoPushToken: { type: String, required: true, unique: true },
-  dispositivoId: String, // Para saber de qué cliente es
+  dispositivoId: String,
   fechaRegistro: { type: Date, default: Date.now }
 });
 
@@ -43,11 +54,8 @@ const Usuario = mongoose.model('Usuario', usuarioSchema);
 
 app.post('/registrar-token', async (req, res) => {
   const { token, dispositivoId } = req.body;
-
   if (!token) return res.status(400).send('Falta el token');
-
   try {
-    // Busca si el token ya existe, si no, lo crea (upsert)
     await Usuario.findOneAndUpdate(
       { expoPushToken: token },
       { dispositivoId: dispositivoId },
@@ -77,7 +85,7 @@ client.on('message', async (topic, message) => {
   if (topic === 'UACH1/nivel_tanque') {
     const nivel = parseInt(message.toString());
     const ahora = new Date();
-    
+
     if (typeof global.ultimoGuardado === 'undefined') global.ultimoGuardado = new Date(0);
     const diferenciaHoras = (ahora - global.ultimoGuardado) / (1000 * 60 * 60);
 
@@ -93,15 +101,71 @@ client.on('message', async (topic, message) => {
       } catch (e) { console.error("Error DB:", e); }
     }
 
-    // Lógica de Notificaciones
-    if (nivel >= 95 && !avisoLlenoEnviado) {
-      enviarNotificacion("¡Cisterna Llena! 🌊", "Nivel al máximo.");
-      avisoLlenoEnviado = true; avisoBajoEnviado = false;
-    } else if (nivel <= 25 && !avisoBajoEnviado) {
-      enviarNotificacion("¡Nivel Crítico! 🚨", `Nivel bajo (${nivel}%).`);
-      avisoBajoEnviado = true; avisoLlenoEnviado = false;
-    } else if (nivel > 30 && nivel < 90) {
-      avisoLlenoEnviado = false; avisoBajoEnviado = false;
+    // ─────────────────────────────────────────────────────────────
+    // CAMBIO 2: Nueva lógica de notificaciones con intervalos.
+    //
+    // Para cada estado se verifica si:
+    //   a) Nunca se ha enviado una notificación (null), O
+    //   b) Ya pasó el intervalo de tiempo correspondiente.
+    //
+    // Así se evita spamear al usuario y se repite el aviso
+    // periódicamente mientras el nivel siga en ese rango.
+    // ─────────────────────────────────────────────────────────────
+
+    if (nivel <= 25) {
+      // ESTADO CRÍTICO BAJO:
+      // Primera vez: notifica de inmediato.
+      // Siguientes: notifica cada 15 minutos mientras siga bajo.
+      // Se resetea ultimaNotifLleno y ultimaNotifEstable para que
+      // cuando salga del estado crítico vuelva a notificar fresco.
+      const debeNotificar = !ultimaNotifBajo ||
+        (ahora - ultimaNotifBajo) >= INTERVALO_CRITICO_MS;
+
+      if (debeNotificar) {
+        await enviarNotificacion(
+          "¡Nivel Crítico! 🚨",
+          `La cisterna está al ${nivel}%. ¡Se necesita agua!`
+        );
+        ultimaNotifBajo  = ahora;
+        ultimaNotifLleno   = null; // Resetea el otro estado
+        ultimaNotifEstable = null;
+      }
+
+    } else if (nivel >= 100) {
+      // ESTADO LLENO:
+      // Primera vez: notifica de inmediato.
+      // Siguientes: notifica cada 15 minutos mientras siga lleno.
+      const debeNotificar = !ultimaNotifLleno ||
+        (ahora - ultimaNotifLleno) >= INTERVALO_CRITICO_MS;
+
+      if (debeNotificar) {
+        await enviarNotificacion(
+          "¡Cisterna Llena! 🌊",
+          `La cisterna está al ${nivel}%. Nivel al máximo.`
+        );
+        ultimaNotifLleno   = ahora;
+        ultimaNotifBajo    = null; // Resetea el otro estado
+        ultimaNotifEstable = null;
+      }
+
+    } else {
+      // ESTADO ESTABLE (26–99):
+      // Notifica una vez por hora para informar que todo está bien.
+      // Al entrar a este rango se resetean los estados críticos para
+      // que cuando vuelvan a ocurrir se notifique de inmediato.
+      ultimaNotifBajo  = null;
+      ultimaNotifLleno = null;
+
+      const debeNotificar = !ultimaNotifEstable ||
+        (ahora - ultimaNotifEstable) >= INTERVALO_ESTABLE_MS;
+
+      if (debeNotificar) {
+        await enviarNotificacion(
+          "Nivel Normal ✅",
+          `La cisterna está al ${nivel}%. Todo en orden.`
+        );
+        ultimaNotifEstable = ahora;
+      }
     }
   }
 });
@@ -132,18 +196,12 @@ app.get('/reporte-semanal', async (req, res) => {
   } catch (error) { res.status(500).send('Error'); }
 });
 
-// Ruta para obtener las últimas 24 lecturas (para la gráfica)
 app.get('/historial/:dispositivoId', async (req, res) => {
   try {
     const { dispositivoId } = req.params;
-    
-    // Buscamos las últimas 24 lecturas de ese dispositivo
-    // Las ordenamos por fecha (de la más reciente a la más vieja)
     const lecturas = await Lectura.find({ dispositivoId })
       .sort({ fecha: -1 })
       .limit(24);
-
-    // Las invertimos para que en la gráfica salgan de izquierda (pasado) a derecha (presente)
     res.json(lecturas.reverse());
   } catch (error) {
     console.error('Error al obtener historial:', error);
@@ -158,13 +216,10 @@ app.listen(PORT, '0.0.0.0', () => {
 
 async function enviarNotificacion(titulo, cuerpo) {
   try {
-    // 1. Buscamos todos los tokens guardados en la DB
     const usuarios = await Usuario.find();
     const tokens = usuarios.map(u => u.expoPushToken);
-
     if (tokens.length === 0) return;
 
-    // 2. Preparamos los mensajes
     let messages = [];
     for (let pushToken of tokens) {
       if (!Expo.isExpoPushToken(pushToken)) continue;
@@ -177,12 +232,11 @@ async function enviarNotificacion(titulo, cuerpo) {
       });
     }
 
-    // 3. Enviamos en paquetes (chunks)
     let chunks = expo.chunkPushNotifications(messages);
     for (let chunk of chunks) {
       await expo.sendPushNotificationsAsync(chunk);
     }
-    console.log(`📢 Alerta enviada a ${tokens.length} dispositivos.`);
+    console.log(`📢 Alerta enviada a ${tokens.length} dispositivos: ${titulo}`);
   } catch (error) {
     console.error('❌ Error enviando notificaciones:', error);
   }
