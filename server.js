@@ -86,20 +86,41 @@ client.on('message', async (topic, message) => {
     const nivel = parseInt(message.toString());
     const ahora = new Date();
 
-    if (typeof global.ultimoGuardado === 'undefined') global.ultimoGuardado = new Date(0);
-    const diferenciaHoras = (ahora - global.ultimoGuardado) / (1000 * 60 * 60);
+  if (typeof global.ultimoGuardado === 'undefined') global.ultimoGuardado = new Date(0);
 
-    let debeGuardar = diferenciaHoras >= 1 || nivel <= 25 || nivel >= 100;
-    let estadoBombaActual = nivel <= 25 ? "Apagada" : (nivel >= 95 ? "Encendida" : "Estable");
+  const INTERVALO_GUARDADO_NORMAL_MS  = 60 * 60 * 1000;      // 1 hora
+  const INTERVALO_GUARDADO_CRITICO_MS = 15 * 60 * 1000;      // 15 minutos
 
-    if (debeGuardar) {
-      try {
-        const nuevaLectura = new Lectura({ dispositivo: 'UACH1', nivel, estadoBomba: estadoBombaActual });
-        await nuevaLectura.save();
-        global.ultimoGuardado = ahora;
-        console.log(`💾 Guardado: ${nivel}%`);
-      } catch (e) { console.error("Error DB:", e); }
-    }
+  const msSinGuardar = ahora - global.ultimoGuardado;
+  const esCritico    = nivel <= 25 || nivel >= 100;
+  const intervalo    = esCritico ? INTERVALO_GUARDADO_CRITICO_MS : INTERVALO_GUARDADO_NORMAL_MS;
+  const debeGuardar  = msSinGuardar >= intervalo;
+
+  let estadoBombaActual = nivel <= 25 ? "Apagada" : (nivel >= 95 ? "Encendida" : "Estable");
+
+  if (debeGuardar) {
+    try {
+      const nuevaLectura = new Lectura({ dispositivo: 'UACH1', nivel, estadoBomba: estadoBombaActual });
+      await nuevaLectura.save();
+      global.ultimoGuardado = ahora;
+      console.log(`💾 Guardado: ${nivel}%`);
+    } catch (e) { console.error("Error DB:", e); }
+  }
+
+    // if (typeof global.ultimoGuardado === 'undefined') global.ultimoGuardado = new Date(0);
+    // const diferenciaHoras = (ahora - global.ultimoGuardado) / (1000 * 60 * 60);
+
+    // let debeGuardar = diferenciaHoras >= 1 || nivel <= 25 || nivel >= 100;
+    // let estadoBombaActual = nivel <= 25 ? "Apagada" : (nivel >= 95 ? "Encendida" : "Estable");
+
+    // if (debeGuardar) {
+    //   try {
+    //     const nuevaLectura = new Lectura({ dispositivo: 'UACH1', nivel, estadoBomba: estadoBombaActual });
+    //     await nuevaLectura.save();
+    //     global.ultimoGuardado = ahora;
+    //     console.log(`💾 Guardado: ${nivel}%`);
+    //   } catch (e) { console.error("Error DB:", e); }
+    // }
 
     // ─────────────────────────────────────────────────────────────
     // CAMBIO 2: Nueva lógica de notificaciones con intervalos.
