@@ -188,7 +188,7 @@ app.get('/reporte-semanal', async (req, res) => {
     ];
     datos.forEach(item => {
       worksheet.addRow({
-        fecha: item.fecha.toLocaleString(),
+        fecha: item.fecha.toLocaleString('es-MX', { timeZone: 'America/Chihuahua' }),
         nivel: item.nivel,
         estado: item.estadoBomba
       });
