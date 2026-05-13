@@ -17,18 +17,19 @@ const mongoURI = process.env.MONGO_URI;
 const expo = new Expo();
 
 // ─────────────────────────────────────────────────────────────
-// CAMBIO 1: Ya no usamos banderas simples (avisoLlenoEnviado /
-// avisoBajoEnviado). Ahora guardamos el TIMESTAMP de la última
-// notificación enviada para cada estado, lo que nos permite
-// controlar intervalos de tiempo en lugar de solo "ya avisé / no avisé".
+// INTERVALOS
 // ─────────────────────────────────────────────────────────────
-let ultimaNotifBajo    = null; // Fecha del último aviso de nivel bajo (<=25)
-let ultimaNotifLleno   = null; // Fecha del último aviso de cisterna llena (>=100)
-let ultimaNotifEstable = null; // Fecha del último aviso de nivel estable (26–99)
+const INTERVALO_HORA  = 60 * 60 * 1000;   // 1 hora  → guardado y notif estable
+const INTERVALO_15MIN = 15 * 60 * 1000;   // 15 min  → guardado y notif crítica
 
-// Intervalos de repetición
-const INTERVALO_CRITICO_MS = 15 * 60 * 1000; // 15 minutos en milisegundos
-const INTERVALO_ESTABLE_MS = 60 * 60 * 1000; // 1 hora en milisegundos
+// ─────────────────────────────────────────────────────────────
+// TIMESTAMPS — controlan cuándo se guardó o notificó por última vez
+// Se usan en lugar de banderas booleanas para poder medir intervalos
+// ─────────────────────────────────────────────────────────────
+let ultimoGuardado     = new Date(0); // new Date(0) = nunca guardado
+let ultimaNotifBajo    = null;        // Última notif nivel bajo   (<=25)
+let ultimaNotifLleno   = null;        // Última notif nivel lleno  (>=100)
+let ultimaNotifEstable = null;        // Última notif nivel estable (26-99)
 
 // --- CONEXIÓN BASE DE DATOS ---
 mongoose.connect(mongoURI)
@@ -41,7 +42,6 @@ const lecturaSchema = new mongoose.Schema({
   estadoBomba: String,
   fecha: { type: Date, default: Date.now }
 });
-
 const Lectura = mongoose.model('Lectura', lecturaSchema);
 
 const usuarioSchema = new mongoose.Schema({
@@ -49,16 +49,16 @@ const usuarioSchema = new mongoose.Schema({
   dispositivoId: String,
   fechaRegistro: { type: Date, default: Date.now }
 });
-
 const Usuario = mongoose.model('Usuario', usuarioSchema);
 
+// --- RUTA: Registrar token del celular ---
 app.post('/registrar-token', async (req, res) => {
   const { token, dispositivoId } = req.body;
   if (!token) return res.status(400).send('Falta el token');
   try {
     await Usuario.findOneAndUpdate(
       { expoPushToken: token },
-      { dispositivoId: dispositivoId },
+      { dispositivoId },
       { upsert: true, new: true }
     );
     console.log(`📱 Token registrado/actualizado: ${token}`);
@@ -73,7 +73,6 @@ app.post('/registrar-token', async (req, res) => {
 const opcionesMqtt = {
   clientId: 'VigilanteBackend_' + Math.random().toString(16).substring(2, 10)
 };
-
 const client = mqtt.connect('wss://broker.emqx.io:8084/mqtt', opcionesMqtt);
 
 client.on('connect', () => {
@@ -82,116 +81,98 @@ client.on('connect', () => {
 });
 
 client.on('message', async (topic, message) => {
-  if (topic === 'UACH1/nivel_tanque') {
-    const nivel = parseInt(message.toString());
-    const ahora = new Date();
+  if (topic !== 'UACH1/nivel_tanque') return;
 
-  if (typeof global.ultimoGuardado === 'undefined') global.ultimoGuardado = new Date(0);
+  const nivel = parseInt(message.toString());
+  if (isNaN(nivel)) return;
 
-  const INTERVALO_GUARDADO_NORMAL_MS  = 60 * 60 * 1000;      // 1 hora
-  const INTERVALO_GUARDADO_CRITICO_MS = 15 * 60 * 1000;      // 15 minutos
+  const ahora = new Date();
+  const esCritico = nivel <= 25 || nivel >= 100;
 
-  const msSinGuardar = ahora - global.ultimoGuardado;
-  const esCritico    = nivel <= 25 || nivel >= 100;
-  const intervalo    = esCritico ? INTERVALO_GUARDADO_CRITICO_MS : INTERVALO_GUARDADO_NORMAL_MS;
-  const debeGuardar  = msSinGuardar >= intervalo;
+  // ─────────────────────────────────────────────────────────────
+  // GUARDAR EN BASE DE DATOS
+  //
+  // Nivel crítico (<=25 o >=100): guarda cada 15 minutos
+  // Nivel estable (26–99)       : guarda cada 1 hora
+  //
+  // Así el reporte siempre tiene los momentos importantes
+  // sin llenar la DB con lecturas basura cada segundo.
+  // ─────────────────────────────────────────────────────────────
+  const msSinGuardar      = ahora - ultimoGuardado;
+  const intervaloGuardado = esCritico ? INTERVALO_15MIN : INTERVALO_HORA;
 
-  let estadoBombaActual = nivel <= 25 ? "Apagada" : (nivel >= 95 ? "Encendida" : "Estable");
-
-  if (debeGuardar) {
+  if (msSinGuardar >= intervaloGuardado) {
+    const estadoBomba = nivel <= 25 ? 'Apagada' : nivel >= 95 ? 'Encendida' : 'Estable';
     try {
-      const nuevaLectura = new Lectura({ dispositivo: 'UACH1', nivel, estadoBomba: estadoBombaActual });
-      await nuevaLectura.save();
-      global.ultimoGuardado = ahora;
-      console.log(`💾 Guardado: ${nivel}%`);
-    } catch (e) { console.error("Error DB:", e); }
+      await new Lectura({ dispositivo: 'UACH1', nivel, estadoBomba }).save();
+      ultimoGuardado = ahora;
+      console.log(`💾 Guardado → Nivel: ${nivel}% | Bomba: ${estadoBomba}`);
+    } catch (e) {
+      console.error('Error al guardar lectura:', e);
+    }
   }
 
-    // if (typeof global.ultimoGuardado === 'undefined') global.ultimoGuardado = new Date(0);
-    // const diferenciaHoras = (ahora - global.ultimoGuardado) / (1000 * 60 * 60);
+  // ─────────────────────────────────────────────────────────────
+  // NOTIFICACIONES
+  //
+  // Estado BAJO (<=25):
+  //   Primera notif: inmediata. Siguientes: cada 15 min.
+  //
+  // Estado LLENO (>=100):
+  //   Primera notif: inmediata. Siguientes: cada 15 min.
+  //
+  // Estado ESTABLE (26–99):
+  //   Notifica cada 1 hora para informar que todo está bien.
+  //   Al entrar aquí se resetean los timestamps críticos para
+  //   que la próxima alerta crítica salga de inmediato.
+  // ─────────────────────────────────────────────────────────────
+  if (nivel <= 25) {
+    const debeNotificar = !ultimaNotifBajo ||
+      (ahora - ultimaNotifBajo) >= INTERVALO_15MIN;
 
-    // let debeGuardar = diferenciaHoras >= 1 || nivel <= 25 || nivel >= 100;
-    // let estadoBombaActual = nivel <= 25 ? "Apagada" : (nivel >= 95 ? "Encendida" : "Estable");
+    if (debeNotificar) {
+      await enviarNotificacion(
+        '¡Nivel Crítico! 🚨',
+        `La cisterna está al ${nivel}%. ¡Se necesita agua urgente!`
+      );
+      ultimaNotifBajo    = ahora;
+      ultimaNotifLleno   = null;
+      ultimaNotifEstable = null;
+    }
 
-    // if (debeGuardar) {
-    //   try {
-    //     const nuevaLectura = new Lectura({ dispositivo: 'UACH1', nivel, estadoBomba: estadoBombaActual });
-    //     await nuevaLectura.save();
-    //     global.ultimoGuardado = ahora;
-    //     console.log(`💾 Guardado: ${nivel}%`);
-    //   } catch (e) { console.error("Error DB:", e); }
-    // }
+  } else if (nivel >= 100) {
+    const debeNotificar = !ultimaNotifLleno ||
+      (ahora - ultimaNotifLleno) >= INTERVALO_15MIN;
 
-    // ─────────────────────────────────────────────────────────────
-    // CAMBIO 2: Nueva lógica de notificaciones con intervalos.
-    //
-    // Para cada estado se verifica si:
-    //   a) Nunca se ha enviado una notificación (null), O
-    //   b) Ya pasó el intervalo de tiempo correspondiente.
-    //
-    // Así se evita spamear al usuario y se repite el aviso
-    // periódicamente mientras el nivel siga en ese rango.
-    // ─────────────────────────────────────────────────────────────
+    if (debeNotificar) {
+      await enviarNotificacion(
+        '¡Cisterna Llena! 🌊',
+        `La cisterna está al ${nivel}%. Nivel al máximo, revisa la bomba.`
+      );
+      ultimaNotifLleno   = ahora;
+      ultimaNotifBajo    = null;
+      ultimaNotifEstable = null;
+    }
 
-    if (nivel <= 25) {
-      // ESTADO CRÍTICO BAJO:
-      // Primera vez: notifica de inmediato.
-      // Siguientes: notifica cada 15 minutos mientras siga bajo.
-      // Se resetea ultimaNotifLleno y ultimaNotifEstable para que
-      // cuando salga del estado crítico vuelva a notificar fresco.
-      const debeNotificar = !ultimaNotifBajo ||
-        (ahora - ultimaNotifBajo) >= INTERVALO_CRITICO_MS;
+  } else {
+    // Volvió a nivel estable: resetea críticos para próxima alerta inmediata
+    ultimaNotifBajo  = null;
+    ultimaNotifLleno = null;
 
-      if (debeNotificar) {
-        await enviarNotificacion(
-          "¡Nivel Crítico! 🚨",
-          `La cisterna está al ${nivel}%. ¡Se necesita agua!`
-        );
-        ultimaNotifBajo  = ahora;
-        ultimaNotifLleno   = null; // Resetea el otro estado
-        ultimaNotifEstable = null;
-      }
+    const debeNotificar = !ultimaNotifEstable ||
+      (ahora - ultimaNotifEstable) >= INTERVALO_HORA;
 
-    } else if (nivel >= 100) {
-      // ESTADO LLENO:
-      // Primera vez: notifica de inmediato.
-      // Siguientes: notifica cada 15 minutos mientras siga lleno.
-      const debeNotificar = !ultimaNotifLleno ||
-        (ahora - ultimaNotifLleno) >= INTERVALO_CRITICO_MS;
-
-      if (debeNotificar) {
-        await enviarNotificacion(
-          "¡Cisterna Llena! 🌊",
-          `La cisterna está al ${nivel}%. Nivel al máximo.`
-        );
-        ultimaNotifLleno   = ahora;
-        ultimaNotifBajo    = null; // Resetea el otro estado
-        ultimaNotifEstable = null;
-      }
-
-    } else {
-      // ESTADO ESTABLE (26–99):
-      // Notifica una vez por hora para informar que todo está bien.
-      // Al entrar a este rango se resetean los estados críticos para
-      // que cuando vuelvan a ocurrir se notifique de inmediato.
-      ultimaNotifBajo  = null;
-      ultimaNotifLleno = null;
-
-      const debeNotificar = !ultimaNotifEstable ||
-        (ahora - ultimaNotifEstable) >= INTERVALO_ESTABLE_MS;
-
-      if (debeNotificar) {
-        await enviarNotificacion(
-          "Nivel Normal ✅",
-          `La cisterna está al ${nivel}%. Todo en orden.`
-        );
-        ultimaNotifEstable = ahora;
-      }
+    if (debeNotificar) {
+      await enviarNotificacion(
+        'Nivel Normal ✅',
+        `La cisterna está al ${nivel}%. Todo en orden.`
+      );
+      ultimaNotifEstable = ahora;
     }
   }
 });
 
-// --- RUTAS ---
+// --- RUTA: Reporte semanal en Excel ---
 app.get('/reporte-semanal', async (req, res) => {
   try {
     const unaSemanaAtras = new Date();
@@ -202,21 +183,28 @@ app.get('/reporte-semanal', async (req, res) => {
     const worksheet = workbook.addWorksheet('Reporte');
     worksheet.columns = [
       { header: 'Fecha y Hora', key: 'fecha', width: 25 },
-      { header: 'Nivel (%)', key: 'nivel', width: 12 },
+      { header: 'Nivel (%)',    key: 'nivel', width: 12 },
       { header: 'Estado Bomba', key: 'estado', width: 18 }
     ];
-
     datos.forEach(item => {
-      worksheet.addRow({ fecha: item.fecha.toLocaleString(), nivel: item.nivel, estado: item.estadoBomba });
+      worksheet.addRow({
+        fecha: item.fecha.toLocaleString(),
+        nivel: item.nivel,
+        estado: item.estadoBomba
+      });
     });
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename=Reporte.xlsx');
     await workbook.xlsx.write(res);
     res.end();
-  } catch (error) { res.status(500).send('Error'); }
+  } catch (error) {
+    console.error('Error generando reporte:', error);
+    res.status(500).send('Error');
+  }
 });
 
+// --- RUTA: Historial de lecturas ---
 app.get('/historial/:dispositivoId', async (req, res) => {
   try {
     const { dispositivoId } = req.params;
@@ -232,17 +220,18 @@ app.get('/historial/:dispositivoId', async (req, res) => {
 
 // --- INICIO DEL SERVIDOR ---
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Servidor en puerto ${PORT}`);
+  console.log(`🚀 Servidor corriendo en puerto ${PORT}`);
 });
 
+// --- FUNCIÓN: Enviar notificación push a todos los dispositivos registrados ---
 async function enviarNotificacion(titulo, cuerpo) {
   try {
     const usuarios = await Usuario.find();
     const tokens = usuarios.map(u => u.expoPushToken);
     if (tokens.length === 0) return;
 
-    let messages = [];
-    for (let pushToken of tokens) {
+    const messages = [];
+    for (const pushToken of tokens) {
       if (!Expo.isExpoPushToken(pushToken)) continue;
       messages.push({
         to: pushToken,
@@ -253,11 +242,11 @@ async function enviarNotificacion(titulo, cuerpo) {
       });
     }
 
-    let chunks = expo.chunkPushNotifications(messages);
-    for (let chunk of chunks) {
+    const chunks = expo.chunkPushNotifications(messages);
+    for (const chunk of chunks) {
       await expo.sendPushNotificationsAsync(chunk);
     }
-    console.log(`📢 Alerta enviada a ${tokens.length} dispositivos: ${titulo}`);
+    console.log(`📢 Notificación enviada a ${tokens.length} dispositivo(s): "${titulo}"`);
   } catch (error) {
     console.error('❌ Error enviando notificaciones:', error);
   }
